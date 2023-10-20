@@ -99,13 +99,73 @@ func loadModel[Model any](r io.Reader, getEvent func(name string) Event[Model], 
 	return model, nil
 }
 
+// ForReading returns the model for reading.
+//
+// Call the done function, when reading is finished.
+//
+// m, done := model.ForReading()
+// defer done()
+//
+// m...
+func (s *Sticky[Model]) ForReading() (Model, func()) {
+	s.mu.RLock()
+	return s.model, func() { s.mu.RUnlock() }
+}
+
+// ForWriting returns the model for writing.
+//
+// Call the write function with one or more events, when you are done.
+//
+// m, write := model.ForWriting()
+//
+// event := ...
+// write(event)
+func (s *Sticky[Model]) ForWriting() (Model, func(...Event[Model]) error) {
+	s.mu.Lock()
+	return s.model, func(events ...Event[Model]) error {
+		defer s.mu.Unlock()
+
+		for _, event := range events {
+			if err := event.Validate(s.model); err != nil {
+				return ValidationError{err}
+			}
+		}
+
+		for _, event := range events {
+			now := s.now().UTC()
+			rawEvent := struct {
+				Time    string       `json:"time"`
+				Type    string       `json:"type"`
+				Payload Event[Model] `json:"payload"`
+			}{
+				now.Format(timeFormat),
+				event.Name(),
+				event,
+			}
+
+			bs, err := json.Marshal(rawEvent)
+			if err != nil {
+				return fmt.Errorf("encoding event: %w", err)
+			}
+
+			if err := s.db.Append(bs); err != nil {
+				return fmt.Errorf("writing event to db: `%s`: %w", bs, err)
+			}
+
+			s.model = event.Execute(s.model, s.now())
+		}
+
+		return nil
+	}
+}
+
 // Read calls a function that has access to an instance of the model for
 // reading.
 func (s *Sticky[Model]) Read(f func(Model) error) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	m, done := s.ForReading()
+	defer done()
 
-	return f(s.model)
+	return f(m)
 }
 
 // Write calls a function that has access to an instance of the model for
@@ -114,38 +174,9 @@ func (s *Sticky[Model]) Read(f func(Model) error) error {
 // Write can return a ValidationError or ExecutionError when the event can not
 // be processed.
 func (s *Sticky[Model]) Write(f func(Model) Event[Model]) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	event := f(s.model)
-
-	if err := event.Validate(s.model); err != nil {
-		return ValidationError{err}
-	}
-
-	now := s.now().UTC()
-	rawEvent := struct {
-		Time    string       `json:"time"`
-		Type    string       `json:"type"`
-		Payload Event[Model] `json:"payload"`
-	}{
-		now.Format(timeFormat),
-		event.Name(),
-		event,
-	}
-
-	bs, err := json.Marshal(rawEvent)
-	if err != nil {
-		return fmt.Errorf("encoding event: %w", err)
-	}
-
-	if err := s.db.Append(bs); err != nil {
-		return fmt.Errorf("writing event to db: `%s`: %w", bs, err)
-	}
-
-	s.model = event.Execute(s.model, s.now())
-
-	return nil
+	m, write := s.ForWriting()
+	event := f(m)
+	return write(event)
 }
 
 // ValidationError happens, when the event can not be validated.
