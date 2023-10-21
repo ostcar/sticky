@@ -116,13 +116,21 @@ func (s *Sticky[Model]) ForReading() (Model, func()) {
 //
 // Call the write function with one or more events, when you are done.
 //
+// A second call to write is a noop.
+//
 // m, write := model.ForWriting()
+// defer write()
 //
 // event := ...
 // write(event)
 func (s *Sticky[Model]) ForWriting() (Model, func(...Event[Model]) error) {
 	s.mu.Lock()
+	var unlocked bool
 	return s.model, func(events ...Event[Model]) error {
+		if unlocked {
+			return nil
+		}
+		unlocked = true
 		defer s.mu.Unlock()
 
 		for _, event := range events {
