@@ -3,11 +3,14 @@ package sticky
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"sync"
 	"time"
+
+	"github.com/ostcar/topic"
 )
 
 // Event is a set of functions that can modify a model.
@@ -28,8 +31,9 @@ type Sticky[Model any] struct {
 	mu    sync.RWMutex
 	model Model
 
-	now func() time.Time
-	db  database
+	now   func() time.Time
+	db    database
+	topic *topic.Topic[string]
 }
 
 // New initializes a new Sticky instance.
@@ -49,6 +53,7 @@ func New[Model any](db database, emptyModel Model, getEvent func(name string) Ev
 		model: model,
 		now:   time.Now,
 		db:    db,
+		topic: topic.New[string](),
 	}
 
 	for _, o := range os {
@@ -155,6 +160,7 @@ func (s *Sticky[Model]) ForWriting() (Model, func(...Event[Model]) error, func()
 				}
 
 				s.model = event.Execute(s.model, s.now())
+				s.topic.Publish(event.Name())
 			}
 
 			return nil
@@ -183,6 +189,22 @@ func (s *Sticky[Model]) Write(f func(Model) Event[Model]) error {
 	defer done()
 	event := f(m)
 	return write(event)
+}
+
+func (s *Sticky[Model]) Listen(ctx context.Context) func(yield func(val []string) bool) {
+	tid := s.topic.LastID()
+	return func(yield func(val []string) bool) {
+		for {
+			newTID, eventNames, err := s.topic.Receive(ctx, tid)
+			if err != nil {
+				return
+			}
+			tid = newTID
+			if !yield(eventNames) {
+				return
+			}
+		}
+	}
 }
 
 // ValidationError happens, when the event can not be validated.
