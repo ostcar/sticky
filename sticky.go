@@ -114,57 +114,54 @@ func (s *Sticky[Model]) ForReading() (Model, func()) {
 
 // ForWriting returns the model for writing.
 //
-// Call the write function with one or more events, when you are done.
+// Call the write function with one or more events.
 //
-// A second call to write is a noop.
+// Call the done function, when you are done.
 //
-// m, write := model.ForWriting()
-// defer write()
+// m, write, done := model.ForWriting()
+// defer done()
 //
 // event := ...
 // write(event)
-func (s *Sticky[Model]) ForWriting() (Model, func(...Event[Model]) error) {
+func (s *Sticky[Model]) ForWriting() (Model, func(...Event[Model]) error, func()) {
 	s.mu.Lock()
-	var unlocked bool
-	return s.model, func(events ...Event[Model]) error {
-		if unlocked {
+	return s.model,
+		func(events ...Event[Model]) error {
+			for _, event := range events {
+				if err := event.Validate(s.model); err != nil {
+					return ValidationError{err}
+				}
+			}
+
+			for _, event := range events {
+				now := s.now().UTC()
+				rawEvent := struct {
+					Time    string       `json:"time"`
+					Type    string       `json:"type"`
+					Payload Event[Model] `json:"payload"`
+				}{
+					now.Format(timeFormat),
+					event.Name(),
+					event,
+				}
+
+				bs, err := json.Marshal(rawEvent)
+				if err != nil {
+					return fmt.Errorf("encoding event: %w", err)
+				}
+
+				if err := s.db.Append(bs); err != nil {
+					return fmt.Errorf("writing event to db: `%s`: %w", bs, err)
+				}
+
+				s.model = event.Execute(s.model, s.now())
+			}
+
 			return nil
+		},
+		func() {
+			s.mu.Unlock()
 		}
-		unlocked = true
-		defer s.mu.Unlock()
-
-		for _, event := range events {
-			if err := event.Validate(s.model); err != nil {
-				return ValidationError{err}
-			}
-		}
-
-		for _, event := range events {
-			now := s.now().UTC()
-			rawEvent := struct {
-				Time    string       `json:"time"`
-				Type    string       `json:"type"`
-				Payload Event[Model] `json:"payload"`
-			}{
-				now.Format(timeFormat),
-				event.Name(),
-				event,
-			}
-
-			bs, err := json.Marshal(rawEvent)
-			if err != nil {
-				return fmt.Errorf("encoding event: %w", err)
-			}
-
-			if err := s.db.Append(bs); err != nil {
-				return fmt.Errorf("writing event to db: `%s`: %w", bs, err)
-			}
-
-			s.model = event.Execute(s.model, s.now())
-		}
-
-		return nil
-	}
 }
 
 // Read calls a function that has access to an instance of the model for
@@ -182,7 +179,8 @@ func (s *Sticky[Model]) Read(f func(Model) error) error {
 // Write can return a ValidationError or ExecutionError when the event can not
 // be processed.
 func (s *Sticky[Model]) Write(f func(Model) Event[Model]) error {
-	m, write := s.ForWriting()
+	m, write, done := s.ForWriting()
+	defer done()
 	event := f(m)
 	return write(event)
 }
@@ -198,4 +196,8 @@ func (err ValidationError) Error() string {
 
 func (err ValidationError) Unwrap() error {
 	return err.err
+}
+
+func (err ValidationError) String() string {
+	return err.err.Error()
 }
